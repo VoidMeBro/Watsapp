@@ -5,7 +5,7 @@ const { createReceiptSaver } = require('./receipt');
 
 const usage = [
   'npm start -- --list-groups',
-  'npm start -- --group <group-id@g.us> --folder <path>'
+  'npm start -- --group <group name or ID> --folder <path> [--show-browser]'
 ].join('\n');
 
 function logSaved(name) {
@@ -16,6 +16,7 @@ async function main() {
   const { values } = parseArgs({
     options: {
       'list-groups': { type: 'boolean' },
+      'show-browser': { type: 'boolean' },
       group: { type: 'string' },
       folder: { type: 'string' },
       help: { type: 'boolean', short: 'h' }
@@ -26,19 +27,23 @@ async function main() {
     return;
   }
   const listGroups = values['list-groups'];
-  const validGroup = /^\d+(?:-\d+)?@g\.us$/.test(values.group);
-  if (listGroups ? values.group || values.folder : !validGroup || !values.folder?.trim()) {
+  const groupNameOrId = values.group?.trim();
+  if (listGroups ? values.group || values.folder : !groupNameOrId || !values.folder?.trim()) {
     throw new Error(usage);
   }
 
   const folder = listGroups ? null : resolve(values.folder);
   if (folder) await mkdir(folder, { recursive: true });
   const { Client, LocalAuth } = require('whatsapp-web.js');
-  const qrCode = require('qrcode-terminal');
-  const client = new Client({ authStrategy: new LocalAuth() });
+  const showBrowser = values['show-browser'];
+  const client = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: { headless: !showBrowser }
+  });
   client.on('qr', code => {
-    console.log('On your phone, open WhatsApp > Linked devices > Link a device. Scan this code:');
-    qrCode.generate(code, { small: true });
+    console.log('On your phone, open WhatsApp > Linked devices > Link a device.');
+    if (showBrowser) console.log('Scan the QR code in the WhatsApp Web window.');
+    else require('qrcode-terminal').generate(code, { small: true });
   });
 
   let worker;
@@ -72,8 +77,16 @@ async function main() {
       return;
     }
 
-    const group = await client.getChatById(values.group);
-    if (!group?.isGroup) throw new Error('Group not found. Run with --list-groups to find its ID.');
+    let group;
+    if (/^\d+(?:-\d+)?@g\.us$/.test(groupNameOrId)) {
+      group = await client.getChatById(groupNameOrId);
+    } else {
+      const matches = (await client.getChats()).filter(chat => chat.isGroup && chat.name === groupNameOrId);
+      if (matches.length > 1) throw new Error('More than one group has that name. Use --list-groups to find its ID.');
+      [group] = matches;
+    }
+    if (!group?.isGroup) throw new Error('Group not found. Run with --list-groups to check its name or ID.');
+    const groupId = group.id._serialized;
 
     const saver = createReceiptSaver(folder, async photo => {
       if (!worker) {
@@ -88,7 +101,7 @@ async function main() {
     queue = saver.resume(logSaved, logError);
     receive = message => {
       const chatId = message.fromMe ? message.to : message.from;
-      if (chatId !== values.group || message.type !== 'image' || !message.hasMedia) return;
+      if (chatId !== groupId || message.type !== 'image' || !message.hasMedia) return;
       queue = queue.then(() => saver.save(message)).then(name => {
         if (name) logSaved(name);
       }).catch(logError);
@@ -102,7 +115,10 @@ async function main() {
     process.off('SIGTERM', interrupt);
     await queue.catch(logError);
     if (worker) await worker.terminate();
-    if (client.pupBrowser) await client.destroy();
+    const browser = client.pupBrowser;
+    // whatsapp-web.js still checks isConnected(), which Puppeteer 25 removed.
+    if (browser?.connected && typeof browser.isConnected !== 'function') await browser.close();
+    if (browser) await client.destroy();
   }
 }
 

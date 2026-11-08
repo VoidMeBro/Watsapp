@@ -4,15 +4,17 @@ Watsapp watches a WhatsApp group for new photos and saves them to a folder you c
 
 ## Set up receipt capture
 
-1. Install Node.js 22 or later. Open a terminal in the repository and run `npm ci`.
-2. Run `npm start -- --list-groups`. The first time, scan the QR code from **WhatsApp → Linked devices → Link a device** on your phone. Copy the ID ending in `@g.us` for the group you want.
-3. Run the command below with your group ID and destination folder. Use a folder dedicated to receipts. Watsapp creates it if needed.
+1. Install Node.js 22.12 or later. Open a terminal in the repository and run `npm ci`.
+2. Run the command below with your exact group name and destination folder. Use a folder dedicated to receipts. Watsapp creates it if needed. If multiple groups have the same name, use `npm start -- --list-groups` to find the ID ending in `@g.us` and use that ID instead.
+3. The first time, scan the QR code from **WhatsApp → Linked devices → Link a device** on your phone. Wait for Watsapp to say it is watching the group.
 
 ```powershell
-npm start -- --group "123456789012345678@g.us" --folder "C:\Users\YourName\Documents\Receipts"
+npm start -- --group "My Receipt Group" --folder "C:\Users\YourName\Documents\Receipts"
 ```
 
 Use `npm.cmd` in place of `npm` if PowerShell blocks the npm script. Keep the program running to capture new photos. Press Ctrl+C to stop. The linked session is reused on restart. Watsapp uses [whatsapp-web.js](https://docs.wwebjs.dev/), an unofficial WhatsApp Web integration that can break when WhatsApp changes its web client.
+
+Add `--show-browser` to scan the QR code in a WhatsApp Web window.
 
 ## Saved photos
 
