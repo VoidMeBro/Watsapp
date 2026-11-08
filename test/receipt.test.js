@@ -13,6 +13,11 @@ test('extracts the transaction date and ignores invalid dates and unrelated text
   assert.equal(receiptDetails('Portrait\n5 November 2026'), null);
 });
 
+test('uses the merchant named in the receipt footer when the header is unclear', () => {
+  const text = 'Summerstrand 04 122\nTAX INVOICE\nTOTAL R49.99\nThank you for shopping at Pick n Pay.\n07.11.26';
+  assert.deepEqual(receiptDetails(text), { date: '2026-11-07', store: 'Pick n Pay' });
+});
+
 test('preserves photos through OCR failure and deduplicates successfully named photos', async t => {
   const folder = await mkdtemp(join(tmpdir(), 'watsapp-test-'));
   t.after(async () => {
@@ -21,15 +26,12 @@ test('preserves photos through OCR failure and deduplicates successfully named p
   });
   const bytes = Buffer.from('stand-in for a photo');
   let downloads = 0;
-  const message = {
-    id: { _serialized: 'photo-1' },
-    async downloadMedia() {
-      downloads++;
-      return { mimetype: 'image/png', data: bytes.toString('base64') };
-    }
+  const downloadMedia = async () => {
+    downloads++;
+    return { mimetype: 'image/png', data: bytes.toString('base64') };
   };
   const failingSaver = createReceiptSaver(folder, async () => { throw new Error('OCR failed'); });
-  await assert.rejects(failingSaver.save(message), /OCR failed/);
+  await assert.rejects(failingSaver.save('photo-1', downloadMedia), /OCR failed/);
   assert.match((await readdir(folder))[0], /^pending-/);
 
   const saver = createReceiptSaver(folder, async () => receipt);
@@ -37,6 +39,6 @@ test('preserves photos through OCR failure and deduplicates successfully named p
   await saver.resume(name => saved.push(name), assert.fail);
   assert.match(saved[0], /^2026-11-05 - Fresh Market - [0-9a-f]{16}\.png$/);
   assert.deepEqual(await readFile(join(folder, saved[0])), bytes);
-  assert.equal(await saver.save(message), null);
+  assert.equal(await saver.save('photo-1', downloadMedia), null);
   assert.equal(downloads, 1);
 });

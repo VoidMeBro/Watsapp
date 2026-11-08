@@ -2,7 +2,8 @@ const { mkdir } = require('node:fs/promises');
 const { resolve } = require('node:path');
 const { setTimeout: delay } = require('node:timers/promises');
 const { parseArgs } = require('node:util');
-const { createReceiptSaver } = require('./receipt');
+const { createReceiptSaver, recognizeReceipt } = require('./receipt');
+const { downloadPhoto } = require('./whatsapp');
 
 const usage = [
   'npm start -- --list-groups',
@@ -109,14 +110,14 @@ async function main() {
         await mkdir(cachePath, { recursive: true });
         worker = await createWorker('eng', 1, { cachePath, errorHandler: () => {} });
       }
-      const { data } = await worker.recognize(photo);
-      return data.text;
+      return recognizeReceipt(worker, photo);
     });
     queue = saver.resume(logSaved, logError);
     receive = message => {
       const chatId = message.fromMe ? message.to : message.from;
       if (chatId !== group.id || message.type !== 'image' || !message.hasMedia) return;
-      queue = queue.then(() => saver.save(message)).then(name => {
+      const messageId = message.id._serialized ?? message.id.$1;
+      queue = queue.then(() => saver.save(messageId, () => downloadPhoto(client.pupPage, messageId))).then(name => {
         if (name) logSaved(name);
       }).catch(logError);
     };
