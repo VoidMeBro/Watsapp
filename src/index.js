@@ -115,7 +115,7 @@ async function main() {
         await mkdir(cachePath, { recursive: true });
         worker = await createWorker('eng', 1, { cachePath, errorHandler: () => {} });
       }
-      return recognizeReceipt(worker, photo);
+      return recognizeReceipt(worker, photo, { page: client.pupPage, month });
     });
     const counts = { saved: 0, existing: 0, review: 0, failed: missingIds };
     const failures = new Map();
@@ -123,9 +123,10 @@ async function main() {
       if (stop.signal.aborted) break;
       if (index > 0 && index % 10 === 0) console.log(`Checked ${index} of ${photos.length} images.`);
       try {
-        const { status, name } = await importer.importPhoto(id, () => downloadPhoto(client.pupPage, id));
+        const { status, name, inferred } = await importer.importPhoto(id, () => downloadPhoto(client.pupPage, id));
         counts[status]++;
         if (name) console.log(`${status === 'review' ? 'Needs review' : 'Saved'}: ${name}`);
+        if (inferred) console.log('Used the gallery month and year for a clipped receipt date.');
       } catch (error) {
         counts.failed++;
         const reason = error.message ?? String(error);

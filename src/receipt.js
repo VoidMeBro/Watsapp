@@ -37,6 +37,15 @@ function receiptDate(line) {
   return null;
 }
 
+function safeStoreName(store) {
+  if (!store) return null;
+  const safeStore = store.normalize('NFC')
+    .replace(/[^\p{L}\p{N}\p{M} &.'-]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return Array.from(safeStore).slice(0, 60).join('').replace(/[ .]+$/, '') || null;
+}
+
 function receiptDetails(text) {
   const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   if (!receiptMarker.test(text) || !lines.some(line => money.test(line) && !receiptDate(line))) return null;
@@ -53,24 +62,84 @@ function receiptDetails(text) {
     !headerNoise.test(line) && !receiptDate(line) && !money.test(line) &&
     /^\p{L}/u.test(line) && !/\b(?:street|road|avenue|mall|subtotal|total)\b|@/i.test(line));
   if (!date) return null;
-  if (!store) return { date, store: null };
-
-  const safeStore = store.normalize('NFC')
-    .replace(/[^\p{L}\p{N}\p{M} &.'-]+/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return { date, store: Array.from(safeStore).slice(0, 60).join('').replace(/[ .]+$/, '') };
+  return { date, store: safeStoreName(store) };
 }
 
-async function recognizeReceipt(worker, photo) {
+async function readClippedDate(worker, photo, page, month, width, height) {
+  const { PSM } = require('tesseract.js');
+  const top = Math.ceil(height * 0.964);
+  const { data } = await worker.recognize(photo, {
+    tessedit_pageseg_mode: PSM.SPARSE_TEXT,
+    rectangle: {
+      left: Math.round(width * 0.29), top, width: Math.round(width * 0.37), height: height - top
+    }
+  }, { blocks: true });
+  const words = (data.blocks ?? []).flatMap(block => block.paragraphs)
+    .flatMap(paragraph => paragraph.lines).flatMap(line => line.words);
+  const label = words.find(word => /^date$/i.test(word.text.trim()));
+  if (!label) return null;
+  const { x0, y0, y1 } = label.bbox;
+  const textHeight = y1 - y0;
+  const left = Math.max(0, x0 - Math.round(textHeight * 1.13));
+  const dateTop = y0 + Math.round(textHeight * 0.57);
+  const cropWidth = Math.min(width - left, Math.round(textHeight * 4.35));
+  const cropHeight = height - dateTop;
+  if (cropWidth < 3 || cropHeight < 3 || cropHeight > textHeight * 2) return null;
+
+  // Stretch and deskew the clipped row for two independent contrast reads.
+  const variants = await page.evaluate(async ({ image, left, top, width, height }) => {
+    const source = await createImageBitmap(new Blob([Uint8Array.fromBase64(image)]));
+    const crop = new OffscreenCanvas(width, height);
+    const ctx = crop.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(source, left, top, width, height, 0, 0, width, height);
+    source.close();
+    const { data } = ctx.getImageData(0, 0, width, height);
+    const levels = Uint8Array.from({ length: width * height }, (_, i) =>
+      Math.round((data[i * 4] + data[i * 4 + 1] + data[i * 4 + 2]) / 3));
+    const median = levels.slice().sort()[Math.floor(levels.length / 2)];
+    const crops = [];
+    for (const offset of [22, 20]) {
+      const scale = 4;
+      const canvas = new OffscreenCanvas(width * scale + 30, height * scale + 132);
+      const draw = canvas.getContext('2d');
+      draw.fillStyle = 'white';
+      draw.fillRect(0, 0, canvas.width, canvas.height);
+      draw.translate(15, 65);
+      draw.rotate(-10 * Math.PI / 180);
+      draw.fillStyle = 'black';
+      for (let i = 0; i < levels.length; i++) {
+        if (levels[i] < median - offset) {
+          draw.fillRect((i % width) * scale, Math.floor(i / width) * scale, scale, scale);
+        }
+      }
+      const blob = await canvas.convertToBlob();
+      crops.push(new Uint8Array(await blob.arrayBuffer()).toBase64());
+    }
+    return crops;
+  }, { image: photo.toString('base64'), left, top: dateTop, width: cropWidth, height: cropHeight });
+
+  let confirmedDay;
+  for (const variant of variants) {
+    const { data: reading } = await worker.recognize(Buffer.from(variant, 'base64'), {
+      tessedit_pageseg_mode: PSM.SINGLE_LINE,
+      tessedit_char_whitelist: '0123456789./-'
+    });
+    const day = /^(\d{2})[./-]?$/.exec(reading.text.trim())?.[1];
+    if (!day || reading.confidence < 20 || (confirmedDay && day !== confirmedDay)) return null;
+    confirmedDay = day;
+  }
+  return confirmedDay ? receiptDate(`${month}-${confirmedDay}`) : null;
+}
+
+async function recognizeReceipt(worker, photo, { page, month } = {}) {
   const { PSM } = require('tesseract.js');
   let { data } = await worker.recognize(photo, {}, { text: true, blocks: true, tsv: true });
   const initial = receiptDetails(data.text);
+  const dimensions = data.tsv.split('\n', 1)[0].split('\t');
+  const width = Number(dimensions[8]);
+  const height = Number(dimensions[9]);
   if (!initial?.store) {
     // On photos with a large background, retry OCR on the central paper area.
-    const page = data.tsv.split('\n', 1)[0].split('\t');
-    const width = Number(page[8]);
-    const height = Number(page[9]);
     if (width > 0 && height > 0) {
       const { data: cropped } = await worker.recognize(photo, {
         tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
@@ -88,20 +157,26 @@ async function recognizeReceipt(worker, photo) {
   const lines = (data.blocks ?? []).flatMap(block => block.paragraphs)
     .flatMap(paragraph => paragraph.lines);
   const footer = lines.find(line => storeFooter.test(line.text.trim()));
-  if (!footer) return data.text;
-
-  const { x0, y0, x1, y1 } = footer.bbox;
-  const left = Math.max(0, x0 - 10);
-  const top = Math.max(0, y0 - 5);
-  const { data: refined } = await worker.recognize(photo, {
-    tessedit_pageseg_mode: PSM.SINGLE_LINE,
-    rectangle: { left, top, width: x1 + 10 - left, height: y1 + 5 - top }
-  });
-  const line = refined.text.trim();
-  if (refined.confidence >= footer.confidence && storeFooter.test(line)) {
-    return data.text.replace(footer.text.trim(), line);
+  let text = data.text;
+  if (footer) {
+    const { x0, y0, x1, y1 } = footer.bbox;
+    const left = Math.max(0, x0 - 10);
+    const top = Math.max(0, y0 - 5);
+    const { data: refined } = await worker.recognize(photo, {
+      tessedit_pageseg_mode: PSM.SINGLE_LINE,
+      rectangle: { left, top, width: x1 + 10 - left, height: y1 + 5 - top }
+    });
+    const line = refined.text.trim();
+    if (refined.confidence >= footer.confidence && storeFooter.test(line)) {
+      text = text.replace(footer.text.trim(), line);
+    }
   }
-  return data.text;
+  const details = receiptDetails(text);
+  if (details || !page || !month || !(width >= 100 && height >= 100)) return details;
+
+  const date = await readClippedDate(worker, photo, page, month, width, height);
+  const store = text.split(/\r?\n/).map(line => line.trim().match(storeFooter)).find(Boolean)?.[1];
+  return date ? { date, store: safeStoreName(store), inferred: true } : null;
 }
 
 async function createReceiptImporter(folder, recognize) {
@@ -131,7 +206,7 @@ async function createReceiptImporter(folder, recognize) {
       if (savedHashes.has(contentId)) return { status: 'existing' };
       let details;
       try {
-        details = receiptDetails(await recognize(bytes));
+        details = await recognize(bytes);
       } catch {
         // Keep the original photo when OCR cannot process it.
       }
@@ -148,7 +223,7 @@ async function createReceiptImporter(folder, recognize) {
       }
       savedIds.add(id);
       savedHashes.add(contentId);
-      return { status: details?.store ? 'saved' : 'review', name };
+      return { status: details?.store ? 'saved' : 'review', name, inferred: details?.inferred };
     }
   };
 }

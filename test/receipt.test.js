@@ -3,7 +3,7 @@ const { mkdtemp, readFile, readdir, rmdir, unlink } = require('node:fs/promises'
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const test = require('node:test');
-const { createReceiptImporter, receiptDetails } = require('../src/receipt');
+const { createReceiptImporter, receiptDetails, recognizeReceipt } = require('../src/receipt');
 
 const receipt = 'Fresh Market\nVAT INVOICE\nReturn by 07/12/2026\nDate: 5 Nov 2026\nTOTAL R49.99';
 
@@ -23,6 +23,28 @@ test('prefers a full transaction timestamp over an ambiguous short date', () => 
   assert.deepEqual(receiptDetails(text), { date: '2026-11-08', store: 'TOTAL Summerstrand' });
 });
 
+test('infers a clipped date only when both OCR reads agree on a valid day', async () => {
+  const page = { evaluate: async () => ['YQ==', 'Yg=='] };
+  const label = { text: 'Date', bbox: { x0: 416, y0: 1564, x1: 462, y1: 1587 } };
+  const blocks = [{ paragraphs: [{ lines: [{ words: [label] }] }] }];
+  function workerFor(days) {
+    return {
+      async recognize(_photo, options, output) {
+        if (output?.tsv) return { data: { text: '', tsv: '1\t1\t0\t0\t0\t0\t0\t0\t899\t1599' } };
+        if (options.tessedit_char_whitelist) return { data: { text: days.shift(), confidence: 40 } };
+        return { data: { text: '', blocks: options.tessedit_pageseg_mode === '11' ? blocks : [] } };
+      }
+    };
+  }
+  const photo = Buffer.from('stand-in for a photo');
+  const context = { page, month: '2026-11' };
+  assert.deepEqual(await recognizeReceipt(workerFor(['06', '06']), photo, context), {
+    date: '2026-11-06', store: null, inferred: true
+  });
+  assert.equal(await recognizeReceipt(workerFor(['06', '08']), photo, context), null);
+  assert.equal(await recognizeReceipt(workerFor(['31', '31']), photo, context), null);
+});
+
 test('uses the printed date for naming and skips existing photos', async t => {
   const folder = await mkdtemp(join(tmpdir(), 'watsapp-test-'));
   t.after(async () => {
@@ -35,7 +57,7 @@ test('uses the printed date for naming and skips existing photos', async t => {
     downloads++;
     return { mimetype: 'image/png', data: bytes.toString('base64') };
   };
-  const importer = await createReceiptImporter(folder, async () => receipt);
+  const importer = await createReceiptImporter(folder, async () => receiptDetails(receipt));
   const saved = await importer.importPhoto('photo-1', downloadMedia);
   assert.equal(saved.status, 'saved');
   assert.match(saved.name, /^2026-11-05 - Fresh Market - [0-9a-f]{16}\.png$/);
@@ -44,7 +66,7 @@ test('uses the printed date for naming and skips existing photos', async t => {
   assert.deepEqual(await importer.importPhoto('forwarded-photo-1', downloadMedia), { status: 'existing' });
   assert.equal(downloads, 2);
 
-  const unreadable = await createReceiptImporter(folder, async () => 'Unreadable photo');
+  const unreadable = await createReceiptImporter(folder, async () => null);
   const otherBytes = Buffer.from('another photo');
   const review = await unreadable.importPhoto('photo-2', async () => ({
     mimetype: 'image/png', data: otherBytes.toString('base64')
