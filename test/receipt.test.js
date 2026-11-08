@@ -23,6 +23,19 @@ test('prefers a full transaction timestamp over an ambiguous short date', () => 
   assert.deepEqual(receiptDetails(text), { date: '2026-11-08', store: 'TOTAL Summerstrand' });
 });
 
+test('retries separated text before interpreting a cropped short date', async () => {
+  const worker = {
+    async recognize(_photo, options, output) {
+      if (output.tsv) return { data: { text: 'FANTASY', tsv: '1\t1\t0\t0\t0\t0\t0\t0\t899\t1599' } };
+      assert.equal(options.tessedit_pageseg_mode, '11');
+      return { data: { text: 'FANTASY\n2026/11/03\nVAT INCL\nTotal R179.50' } };
+    }
+  };
+  assert.deepEqual(await recognizeReceipt(worker, Buffer.from('stand-in for a photo')), {
+    date: '2026-11-03', store: 'FANTASY'
+  });
+});
+
 test('infers a clipped date only when both OCR reads agree on a valid day', async () => {
   const page = { evaluate: async () => ['YQ==', 'Yg=='] };
   const label = { text: 'Date', bbox: { x0: 416, y0: 1564, x1: 462, y1: 1587 } };

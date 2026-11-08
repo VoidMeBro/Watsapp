@@ -65,7 +65,7 @@ function receiptDetails(text) {
   return { date, store: safeStoreName(store) };
 }
 
-async function readClippedDate(worker, photo, page, month, width, height) {
+async function readClippedDate(worker, photo, page, month, width, height, text) {
   const { PSM } = require('tesseract.js');
   const top = Math.ceil(height * 0.964);
   const { data } = await worker.recognize(photo, {
@@ -128,30 +128,59 @@ async function readClippedDate(worker, photo, page, month, width, height) {
     if (!day || reading.confidence < 20 || (confirmedDay && day !== confirmedDay)) return null;
     confirmedDay = day;
   }
-  return confirmedDay ? receiptDate(`${month}-${confirmedDay}`) : null;
+  const date = confirmedDay && receiptDate(`${month}-${confirmedDay}`);
+  if (!date) return null;
+
+  let store = text.split(/\r?\n/).map(line => line.trim().match(storeFooter)).find(Boolean)?.[1];
+  const footerTop = y0 - textHeight * 6;
+  const footerLeft = x0 - Math.round(textHeight * 0.91);
+  if (!store && footerTop >= 0 && footerLeft >= 0) {
+    const { data: footer } = await worker.recognize(photo, {
+      tessedit_pageseg_mode: PSM.RAW_LINE,
+      rectangle: {
+        left: footerLeft, top: footerTop,
+        width: Math.min(width - footerLeft, Math.round(textHeight * 6.43)),
+        height: Math.round(textHeight * 1.9)
+      }
+    });
+    const candidate = footer.text.trim().replace(/^\p{L}\s+/u, '');
+    const merchant = candidate.match(/^(\p{L}[\p{L} &'-]+)\s+(\p{L}{3,})$/u);
+    if (footer.confidence >= 55 && merchant &&
+        text.split(/\W+/).some(word => word.toLowerCase() === merchant[2].toLowerCase())) {
+      store = candidate;
+    }
+  }
+  return { date, store: safeStoreName(store), inferred: true };
 }
 
 async function recognizeReceipt(worker, photo, { page, month } = {}) {
   const { PSM } = require('tesseract.js');
   let { data } = await worker.recognize(photo, {}, { text: true, blocks: true, tsv: true });
-  const initial = receiptDetails(data.text);
+  let details = receiptDetails(data.text);
   const dimensions = data.tsv.split('\n', 1)[0].split('\t');
   const width = Number(dimensions[8]);
   const height = Number(dimensions[9]);
-  if (!initial?.store) {
-    // On photos with a large background, retry OCR on the central paper area.
-    if (width > 0 && height > 0) {
-      const { data: cropped } = await worker.recognize(photo, {
-        tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
-        rectangle: {
-          left: Math.round(width * 0.17),
-          top: Math.round(height * 0.16),
-          width: Math.round(width * 0.7),
-          height: Math.round(height * 0.74)
-        }
-      }, { text: true, blocks: true });
-      const details = receiptDetails(cropped.text);
-      if (details?.store || (!initial && details)) data = cropped;
+  if (!details?.store && width > 0 && height > 0) {
+    // Try separated text and paper crops before attempting to infer a date.
+    const passes = [
+      { tessedit_pageseg_mode: PSM.SPARSE_TEXT },
+      { tessedit_pageseg_mode: PSM.SINGLE_BLOCK, rectangle: {
+        left: Math.round(width * 0.17), top: Math.round(height * 0.16),
+        width: Math.round(width * 0.7), height: Math.round(height * 0.74)
+      } },
+      { tessedit_pageseg_mode: PSM.SINGLE_BLOCK, rectangle: {
+        left: Math.round(width * 0.211), top: Math.round(height * 0.32),
+        width: Math.round(width * 0.562), height: Math.round(height * 0.444)
+      } }
+    ];
+    for (const options of passes) {
+      const { data: alternate } = await worker.recognize(photo, options, { text: true, blocks: true });
+      const result = receiptDetails(alternate.text);
+      if (result?.store || (!details && result)) {
+        data = alternate;
+        details = result;
+      }
+      if (details?.store) break;
     }
   }
   const lines = (data.blocks ?? []).flatMap(block => block.paragraphs)
@@ -171,12 +200,10 @@ async function recognizeReceipt(worker, photo, { page, month } = {}) {
       text = text.replace(footer.text.trim(), line);
     }
   }
-  const details = receiptDetails(text);
+  details = receiptDetails(text);
   if (details || !page || !month || !(width >= 100 && height >= 100)) return details;
 
-  const date = await readClippedDate(worker, photo, page, month, width, height);
-  const store = text.split(/\r?\n/).map(line => line.trim().match(storeFooter)).find(Boolean)?.[1];
-  return date ? { date, store: safeStoreName(store), inferred: true } : null;
+  return readClippedDate(worker, photo, page, month, width, height, text);
 }
 
 async function createReceiptImporter(folder, recognize) {
