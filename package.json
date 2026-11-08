@@ -1,0 +1,16 @@
+{
+  "name": "watsapp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Save receipt photos from a WhatsApp group and name them using local OCR",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "qrcode-terminal": "0.12.0",
+    "tesseract.js": "7.0.0",
+    "whatsapp-web.js": "1.34.7"
+  }
+}
