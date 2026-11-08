@@ -104,24 +104,22 @@ async function recognizeReceipt(worker, photo) {
   return data.text;
 }
 
-async function createReceiptImporter(folder, month, recognize) {
+async function createReceiptImporter(folder, recognize) {
   const files = await readdir(folder, { withFileTypes: true });
-  const savedDates = new Map();
-  const contentDates = new Map();
+  const savedIds = new Set();
+  const savedHashes = new Set();
   for (const file of files) {
-    const match = /^(\d{4}-\d{2}-\d{2}) - .+ - ([0-9a-f]{16})\.(?:jpe?g|png|webp)$/i.exec(file.name);
+    const match = /^(?:\d{4}-\d{2}-\d{2} - .+ - |review-)([0-9a-f]{16})\.(?:jpe?g|png|webp)$/i.exec(file.name);
     if (!file.isFile() || !match) continue;
-    const [, date, id] = match;
-    savedDates.set(id, date);
+    savedIds.add(match[1]);
     const bytes = await readFile(join(folder, file.name));
-    contentDates.set(createHash('sha256').update(bytes).digest('hex'), date);
+    savedHashes.add(createHash('sha256').update(bytes).digest('hex'));
   }
   return {
     async importPhoto(messageId, downloadMedia) {
       if (typeof messageId !== 'string' || !messageId) throw new Error('WhatsApp did not provide a photo message ID.');
       const id = createHash('sha256').update(messageId).digest('hex').slice(0, 16);
-      const savedDate = savedDates.get(id);
-      if (savedDate) return { status: savedDate.startsWith(month + '-') ? 'existing' : 'outsideMonth' };
+      if (savedIds.has(id)) return { status: 'existing' };
 
       const media = await downloadMedia();
       if (!media?.data) throw new Error('WhatsApp could not download the photo.');
@@ -130,13 +128,17 @@ async function createReceiptImporter(folder, month, recognize) {
 
       const bytes = Buffer.from(media.data, 'base64');
       const contentId = createHash('sha256').update(bytes).digest('hex');
-      const existingDate = contentDates.get(contentId);
-      if (existingDate) return { status: existingDate.startsWith(month + '-') ? 'existing' : 'outsideMonth' };
-      const details = receiptDetails(await recognize(bytes));
-      if (!details) return { status: 'unreadable' };
-      if (!details.date.startsWith(month + '-')) return { status: 'outsideMonth' };
+      if (savedHashes.has(contentId)) return { status: 'existing' };
+      let details;
+      try {
+        details = receiptDetails(await recognize(bytes));
+      } catch {
+        // Keep the original photo when OCR cannot process it.
+      }
 
-      const name = `${details.date} - ${details.store || 'store-unknown'} - ${id}.${extension}`;
+      const name = details
+        ? `${details.date} - ${details.store || 'store-unknown'} - ${id}.${extension}`
+        : `review-${id}.${extension}`;
       const temp = join(folder, `.watsapp-${randomUUID()}.tmp`);
       try {
         await writeFile(temp, bytes, { flag: 'wx' });
@@ -144,9 +146,9 @@ async function createReceiptImporter(folder, month, recognize) {
       } finally {
         await rm(temp, { force: true });
       }
-      savedDates.set(id, details.date);
-      contentDates.set(contentId, details.date);
-      return { status: 'saved', name };
+      savedIds.add(id);
+      savedHashes.add(contentId);
+      return { status: details?.store ? 'saved' : 'review', name };
     }
   };
 }

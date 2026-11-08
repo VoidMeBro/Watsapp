@@ -98,15 +98,17 @@ async function main() {
 
     const now = new Date();
     const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-    console.log(`Loading image history from "${group.name}" for receipts dated ${month}.`);
+    const start = new Date(now.getFullYear(), now.getMonth(), 1).getTime() / 1000;
+    const end = new Date(now.getFullYear(), now.getMonth() + 1, 1).getTime() / 1000;
+    console.log(`Loading "${group.name}" photos from Media → This month (${month}).`);
     const { photos, missingIds } = await Promise.race([
-      loadPhotoIds(client.pupPage, group.id),
+      loadPhotoIds(client.pupPage, group.id, start, end),
       stopped.then(() => ({ photos: [], missingIds: 0 }))
     ]);
     if (stop.signal.aborted) return;
     console.log(`Checking ${photos.length} available images.`);
 
-    const importer = await createReceiptImporter(folder, month, async photo => {
+    const importer = await createReceiptImporter(folder, async photo => {
       if (!worker) {
         const { createWorker } = require('tesseract.js');
         const cachePath = resolve('.ocr-cache');
@@ -115,7 +117,7 @@ async function main() {
       }
       return recognizeReceipt(worker, photo);
     });
-    const counts = { saved: 0, existing: 0, outsideMonth: 0, unreadable: 0, failed: missingIds };
+    const counts = { saved: 0, existing: 0, review: 0, failed: missingIds };
     const failures = new Map();
     for (const [index, id] of photos.entries()) {
       if (stop.signal.aborted) break;
@@ -123,14 +125,14 @@ async function main() {
       try {
         const { status, name } = await importer.importPhoto(id, () => downloadPhoto(client.pupPage, id));
         counts[status]++;
-        if (name) console.log(`Saved: ${name}`);
+        if (name) console.log(`${status === 'review' ? 'Needs review' : 'Saved'}: ${name}`);
       } catch (error) {
         counts.failed++;
         const reason = error.message ?? String(error);
         failures.set(reason, (failures.get(reason) ?? 0) + 1);
       }
     }
-    console.log(`Imported ${counts.saved}; already saved ${counts.existing}; outside month ${counts.outsideMonth}; unreadable ${counts.unreadable}; failed ${counts.failed}.`);
+    console.log(`Imported ${counts.saved + counts.review}; of those, ${counts.review} need review. Already saved ${counts.existing}; failed ${counts.failed}.`);
     if (missingIds) console.error(`${missingIds} photos had no WhatsApp message ID.`);
     for (const [reason, count] of failures) console.error(`${count} failed: ${reason}`);
     if (counts.failed) process.exitCode = 1;

@@ -1,5 +1,5 @@
-async function loadPhotoIds(page, groupId) {
-  return page.evaluate(async id => {
+async function loadPhotoIds(page, groupId, start, end) {
+  return page.evaluate(async ({ id, start, end }) => {
     const chats = window.require('WAWebCollections').Chat;
     const chat = chats.getModelsArray().find(item =>
       (item.id?._serialized ?? item.id?.serialized ?? item.id?.$1) === id);
@@ -13,24 +13,24 @@ async function loadPhotoIds(page, groupId) {
     let firstBatch = true;
     do {
       const previousCount = seen.size;
+      let reachedPreviousMonth = false;
       for (const message of batch) {
+        if (message.t < start) reachedPreviousMonth = true;
         const messageId = message.id?._serialized ?? message.id?.$1;
-        const image = message.type === 'image' ||
-          (message.type === 'document' && message.mimetype?.startsWith('image/'));
-        if (!messageId) {
-          if (image) missingIds++;
-          continue;
+        if (messageId) {
+          if (seen.has(messageId)) continue;
+          seen.add(messageId);
         }
-        if (seen.has(messageId)) continue;
-        seen.add(messageId);
-        if (image) photos.push(messageId);
+        if (message.type !== 'image' || !(message.t >= start && message.t < end)) continue;
+        if (messageId) photos.push(messageId);
+        else missingIds++;
       }
-      if (!firstBatch && seen.size === previousCount) break;
+      if (reachedPreviousMonth || (!firstBatch && seen.size === previousCount)) break;
       firstBatch = false;
       batch = await loadEarlierMsgs({ chat });
     } while (batch?.length);
     return { photos, missingIds };
-  }, groupId);
+  }, { id: groupId, start, end });
 }
 
 async function downloadPhoto(page, id) {

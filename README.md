@@ -1,12 +1,12 @@
 # Watsapp
 
-Watsapp imports receipt photos from a WhatsApp group into a folder you choose. It uses local OCR to find receipts with a transaction date in the current calendar month and names each original image using that date and the store name.
+Watsapp imports photos from a WhatsApp group's **Media → This month** section into a folder you choose. It uses local OCR to name each original image with the date and store printed on the receipt.
 
 ## Import this month's receipts
 
 1. Install Node.js 22.12 or later. Open a terminal in the repository and run `npm ci`.
 2. Run the command below with your exact group name and destination folder. Use a folder dedicated to receipts. Watsapp creates it if needed. If multiple groups have the same name, use `npm start -- --list-groups` to find the ID ending in `@g.us` and use that ID instead.
-3. The first time, scan the QR code from **WhatsApp → Linked devices → Link a device** on your phone. Watsapp scans the group's available image history, prints a summary, and exits.
+3. The first time, scan the QR code from **WhatsApp → Linked devices → Link a device** on your phone. Watsapp imports this month's gallery photos, prints a summary, and exits.
 
 ```powershell
 npm start -- --group "My Receipt Group" --folder "C:\Users\YourName\Documents\Receipts"
@@ -19,6 +19,6 @@ Add `--show-browser` to scan the QR code in a WhatsApp Web window.
 ## Saved photos
 
 - A receipt might be saved as `2026-11-05 - Fresh Market - a1b2c3d4e5f67890.jpg`. The suffix distinguishes receipts from the same store on the same date and prevents the same message from being saved twice.
-- Watsapp uses the date printed on the receipt to decide which month it belongs to. Ambiguous numeric dates use day/month/year.
-- Photos with an unreadable date are counted in the summary. If the date is readable and falls in the current month, a missing store is marked `store-unknown` in the filename.
-- Watsapp checks the image history available to the linked session and reports images it couldn't download. It processes images on your computer and saves their original bytes. The first OCR run downloads English language data.
+- The gallery month determines which photos to import. The filename uses the printed receipt date, which can fall in a different month. Ambiguous numeric dates use day/month/year.
+- Photos with an unreadable date keep a `review-...` filename. If the date is readable but the store is missing, the filename contains `store-unknown`.
+- Watsapp reports gallery photos it couldn't download. It processes images on your computer and saves their original bytes. The first OCR run downloads English language data.

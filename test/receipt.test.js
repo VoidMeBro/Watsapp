@@ -23,7 +23,7 @@ test('prefers a full transaction timestamp over an ambiguous short date', () => 
   assert.deepEqual(receiptDetails(text), { date: '2026-11-08', store: 'TOTAL Summerstrand' });
 });
 
-test('imports only receipts dated in the requested month and skips existing photos', async t => {
+test('uses the printed date for naming and skips existing photos', async t => {
   const folder = await mkdtemp(join(tmpdir(), 'watsapp-test-'));
   t.after(async () => {
     for (const file of await readdir(folder)) await unlink(join(folder, file));
@@ -35,20 +35,21 @@ test('imports only receipts dated in the requested month and skips existing phot
     downloads++;
     return { mimetype: 'image/png', data: bytes.toString('base64') };
   };
-  const october = await createReceiptImporter(folder, '2026-10', async () => receipt);
-  assert.deepEqual(await october.importPhoto('photo-1', downloadMedia), { status: 'outsideMonth' });
-  assert.deepEqual(await readdir(folder), []);
-
-  const unreadable = await createReceiptImporter(folder, '2026-11', async () => 'Unreadable photo');
-  assert.deepEqual(await unreadable.importPhoto('photo-1', downloadMedia), { status: 'unreadable' });
-  assert.deepEqual(await readdir(folder), []);
-
-  const november = await createReceiptImporter(folder, '2026-11', async () => receipt);
-  const saved = await november.importPhoto('photo-1', downloadMedia);
+  const importer = await createReceiptImporter(folder, async () => receipt);
+  const saved = await importer.importPhoto('photo-1', downloadMedia);
   assert.equal(saved.status, 'saved');
   assert.match(saved.name, /^2026-11-05 - Fresh Market - [0-9a-f]{16}\.png$/);
   assert.deepEqual(await readFile(join(folder, saved.name)), bytes);
-  assert.deepEqual(await november.importPhoto('photo-1', downloadMedia), { status: 'existing' });
-  assert.deepEqual(await november.importPhoto('forwarded-photo-1', downloadMedia), { status: 'existing' });
-  assert.equal(downloads, 4);
+  assert.deepEqual(await importer.importPhoto('photo-1', downloadMedia), { status: 'existing' });
+  assert.deepEqual(await importer.importPhoto('forwarded-photo-1', downloadMedia), { status: 'existing' });
+  assert.equal(downloads, 2);
+
+  const unreadable = await createReceiptImporter(folder, async () => 'Unreadable photo');
+  const otherBytes = Buffer.from('another photo');
+  const review = await unreadable.importPhoto('photo-2', async () => ({
+    mimetype: 'image/png', data: otherBytes.toString('base64')
+  }));
+  assert.equal(review.status, 'review');
+  assert.match(review.name, /^review-[0-9a-f]{16}\.png$/);
+  assert.deepEqual(await readFile(join(folder, review.name)), otherBytes);
 });
