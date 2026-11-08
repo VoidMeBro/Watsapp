@@ -11,8 +11,10 @@ const months = 'jan feb mar apr may jun jul aug sep oct nov dec'.split(' ');
 const receiptMarker = /\b(?:receipt|invoice|subtotal|total|vat|gst|tax|tendered|cashier)\b/i;
 const money = /\d+[.,]\d{2}\b/;
 const storeFooter = /^thank you for shopping at\s+(\p{L}.*)$/iu;
+const storeLabel = /^(?:t\/a\s+|(?:store|merchant|retailer)\s*:\s*)(\p{L}.*)$/iu;
 const transactionDate = /\b(?:date|purchased|transaction|issued|sale)\b/i;
 const otherDate = /\b(?:expir\w*|due date|valid (?:to|until)|return by|print(?:ed)? date)\b/i;
+const fullNumericDate = /\b(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4})\b/;
 const datePattern = /\b(?:(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})|(\d{1,2})[-/.](\d{1,2})[-/.](\d{4}|\d{2})|(\d{1,2})[\s-]+([a-z]{3,9})[\s,-]+(\d{4}|\d{2})|([a-z]{3,9})[\s-]+(\d{1,2})[\s,-]+(\d{4}|\d{2}))\b/gi;
 const headerNoise = /^(?:welcome\b|thank\b|tel\b|phone\b|fax\b|www\.|https?:|vat\b|tax\b|receipt\b|invoice\b|cashier\b|till\b|transaction\b|register\b|date\b|time\b|branch\b|reg(?:istration)?\b|store\s*#)|\b(?:tax invoice|fiscal receipt|sales receipt|customer copy|merchant copy|cash sale|point of sale|cash receipt)\s*$/i;
 
@@ -40,12 +42,14 @@ function receiptDetails(text) {
   if (!receiptMarker.test(text) || !lines.some(line => money.test(line) && !receiptDate(line))) return null;
 
   const dates = lines.filter(line => !otherDate.test(line));
-  const date = dates.filter(line => transactionDate.test(line)).map(receiptDate).find(Boolean)
+  const timestampDate = dates.filter(line => /\b(?:timestamp|\d{1,2}:\d{2})\b/i.test(line))
+    .map(line => line.match(fullNumericDate)?.[0]).filter(Boolean).map(receiptDate).find(Boolean);
+  const date = timestampDate || dates.filter(line => transactionDate.test(line)).map(receiptDate).find(Boolean)
     || dates.map(receiptDate).find(Boolean);
   const headers = lines.slice(0, 8);
-  const labeledStore = headers.find(line => /^(?:store|merchant|retailer)\s*:\s*\p{L}/iu.test(line));
+  const labeledStore = headers.map(line => line.match(storeLabel)).find(Boolean)?.[1];
   const footerStore = lines.map(line => line.match(storeFooter)).find(Boolean)?.[1];
-  const store = labeledStore?.replace(/^[^:]+:\s*/, '') || footerStore || headers.find(line =>
+  const store = labeledStore || footerStore || headers.find(line =>
     !headerNoise.test(line) && !receiptDate(line) && !money.test(line) &&
     /^\p{L}/u.test(line) && !/\b(?:street|road|avenue|mall|subtotal|total)\b|@/i.test(line));
   if (!date || !store) return null;
@@ -58,7 +62,26 @@ function receiptDetails(text) {
 }
 
 async function recognizeReceipt(worker, photo) {
-  const { data } = await worker.recognize(photo, {}, { text: true, blocks: true });
+  const { PSM } = require('tesseract.js');
+  let { data } = await worker.recognize(photo, {}, { text: true, blocks: true, tsv: true });
+  if (!receiptDetails(data.text)) {
+    // On photos with a large background, retry OCR on the central paper area.
+    const page = data.tsv.split('\n', 1)[0].split('\t');
+    const width = Number(page[8]);
+    const height = Number(page[9]);
+    if (width > 0 && height > 0) {
+      const { data: cropped } = await worker.recognize(photo, {
+        tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
+        rectangle: {
+          left: Math.round(width * 0.17),
+          top: Math.round(height * 0.16),
+          width: Math.round(width * 0.7),
+          height: Math.round(height * 0.74)
+        }
+      }, { text: true, blocks: true });
+      if (receiptDetails(cropped.text)) data = cropped;
+    }
+  }
   const lines = (data.blocks ?? []).flatMap(block => block.paragraphs)
     .flatMap(paragraph => paragraph.lines);
   const footer = lines.find(line => storeFooter.test(line.text.trim()));
@@ -67,7 +90,6 @@ async function recognizeReceipt(worker, photo) {
   const { x0, y0, x1, y1 } = footer.bbox;
   const left = Math.max(0, x0 - 10);
   const top = Math.max(0, y0 - 5);
-  const { PSM } = require('tesseract.js');
   const { data: refined } = await worker.recognize(photo, {
     tessedit_pageseg_mode: PSM.SINGLE_LINE,
     rectangle: { left, top, width: x1 + 10 - left, height: y1 + 5 - top }

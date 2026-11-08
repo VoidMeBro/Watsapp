@@ -18,6 +18,11 @@ test('uses the merchant named in the receipt footer when the header is unclear',
   assert.deepEqual(receiptDetails(text), { date: '2026-11-07', store: 'Pick n Pay' });
 });
 
+test('prefers a full transaction timestamp over an ambiguous short date', () => {
+  const text = 'TAX INVOICE\nt/a TOTAL Summerstrand\nTotal R390.00\nDate: 26/11/08 14:08\nEdison Timestamp: 08/11/2026 02:08 PM';
+  assert.deepEqual(receiptDetails(text), { date: '2026-11-08', store: 'TOTAL Summerstrand' });
+});
+
 test('preserves photos through OCR failure and deduplicates successfully named photos', async t => {
   const folder = await mkdtemp(join(tmpdir(), 'watsapp-test-'));
   t.after(async () => {
