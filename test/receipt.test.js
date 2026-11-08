@@ -3,7 +3,7 @@ const { mkdtemp, readFile, readdir, rmdir, unlink } = require('node:fs/promises'
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const test = require('node:test');
-const { createReceiptSaver, receiptDetails } = require('../src/receipt');
+const { createReceiptImporter, receiptDetails } = require('../src/receipt');
 
 const receipt = 'Fresh Market\nVAT INVOICE\nReturn by 07/12/2026\nDate: 5 Nov 2026\nTOTAL R49.99';
 
@@ -23,7 +23,7 @@ test('prefers a full transaction timestamp over an ambiguous short date', () => 
   assert.deepEqual(receiptDetails(text), { date: '2026-11-08', store: 'TOTAL Summerstrand' });
 });
 
-test('preserves photos through OCR failure and deduplicates successfully named photos', async t => {
+test('imports only receipts dated in the requested month and skips existing photos', async t => {
   const folder = await mkdtemp(join(tmpdir(), 'watsapp-test-'));
   t.after(async () => {
     for (const file of await readdir(folder)) await unlink(join(folder, file));
@@ -35,15 +35,20 @@ test('preserves photos through OCR failure and deduplicates successfully named p
     downloads++;
     return { mimetype: 'image/png', data: bytes.toString('base64') };
   };
-  const failingSaver = createReceiptSaver(folder, async () => { throw new Error('OCR failed'); });
-  await assert.rejects(failingSaver.save('photo-1', downloadMedia), /OCR failed/);
-  assert.match((await readdir(folder))[0], /^pending-/);
+  const october = await createReceiptImporter(folder, '2026-10', async () => receipt);
+  assert.deepEqual(await october.importPhoto('photo-1', downloadMedia), { status: 'outsideMonth' });
+  assert.deepEqual(await readdir(folder), []);
 
-  const saver = createReceiptSaver(folder, async () => receipt);
-  const saved = [];
-  await saver.resume(name => saved.push(name), assert.fail);
-  assert.match(saved[0], /^2026-11-05 - Fresh Market - [0-9a-f]{16}\.png$/);
-  assert.deepEqual(await readFile(join(folder, saved[0])), bytes);
-  assert.equal(await saver.save('photo-1', downloadMedia), null);
-  assert.equal(downloads, 1);
+  const unreadable = await createReceiptImporter(folder, '2026-11', async () => 'Unreadable photo');
+  assert.deepEqual(await unreadable.importPhoto('photo-1', downloadMedia), { status: 'unreadable' });
+  assert.deepEqual(await readdir(folder), []);
+
+  const november = await createReceiptImporter(folder, '2026-11', async () => receipt);
+  const saved = await november.importPhoto('photo-1', downloadMedia);
+  assert.equal(saved.status, 'saved');
+  assert.match(saved.name, /^2026-11-05 - Fresh Market - [0-9a-f]{16}\.png$/);
+  assert.deepEqual(await readFile(join(folder, saved.name)), bytes);
+  assert.deepEqual(await november.importPhoto('photo-1', downloadMedia), { status: 'existing' });
+  assert.deepEqual(await november.importPhoto('forwarded-photo-1', downloadMedia), { status: 'existing' });
+  assert.equal(downloads, 4);
 });

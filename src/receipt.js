@@ -1,5 +1,5 @@
 const { createHash, randomUUID } = require('node:crypto');
-const { mkdir, readdir, rename, rm, writeFile } = require('node:fs/promises');
+const { readFile, readdir, rename, rm, writeFile } = require('node:fs/promises');
 const { join } = require('node:path');
 
 const imageExtensions = {
@@ -52,7 +52,8 @@ function receiptDetails(text) {
   const store = labeledStore || footerStore || headers.find(line =>
     !headerNoise.test(line) && !receiptDate(line) && !money.test(line) &&
     /^\p{L}/u.test(line) && !/\b(?:street|road|avenue|mall|subtotal|total)\b|@/i.test(line));
-  if (!date || !store) return null;
+  if (!date) return null;
+  if (!store) return { date, store: null };
 
   const safeStore = store.normalize('NFC')
     .replace(/[^\p{L}\p{N}\p{M} &.'-]+/gu, ' ')
@@ -64,7 +65,8 @@ function receiptDetails(text) {
 async function recognizeReceipt(worker, photo) {
   const { PSM } = require('tesseract.js');
   let { data } = await worker.recognize(photo, {}, { text: true, blocks: true, tsv: true });
-  if (!receiptDetails(data.text)) {
+  const initial = receiptDetails(data.text);
+  if (!initial?.store) {
     // On photos with a large background, retry OCR on the central paper area.
     const page = data.tsv.split('\n', 1)[0].split('\t');
     const width = Number(page[8]);
@@ -79,7 +81,8 @@ async function recognizeReceipt(worker, photo) {
           height: Math.round(height * 0.74)
         }
       }, { text: true, blocks: true });
-      if (receiptDetails(cropped.text)) data = cropped;
+      const details = receiptDetails(cropped.text);
+      if (details?.store || (!initial && details)) data = cropped;
     }
   }
   const lines = (data.blocks ?? []).flatMap(block => block.paragraphs)
@@ -101,55 +104,51 @@ async function recognizeReceipt(worker, photo) {
   return data.text;
 }
 
-function createReceiptSaver(folder, recognize) {
-  async function namePhoto(filename) {
-    const source = join(folder, filename);
-    const { id, extension } = /^pending-(?<id>[0-9a-f]{16})\.(?<extension>\w+)$/.exec(filename).groups;
-    const details = receiptDetails(await recognize(source));
-    const name = details?.store
-      ? `${details.date} - ${details.store} - ${id}.${extension}`
-      : `review-${id}.${extension}`;
-    await rename(source, join(folder, name));
-    return name;
+async function createReceiptImporter(folder, month, recognize) {
+  const files = await readdir(folder, { withFileTypes: true });
+  const savedDates = new Map();
+  const contentDates = new Map();
+  for (const file of files) {
+    const match = /^(\d{4}-\d{2}-\d{2}) - .+ - ([0-9a-f]{16})\.(?:jpe?g|png|webp)$/i.exec(file.name);
+    if (!file.isFile() || !match) continue;
+    const [, date, id] = match;
+    savedDates.set(id, date);
+    const bytes = await readFile(join(folder, file.name));
+    contentDates.set(createHash('sha256').update(bytes).digest('hex'), date);
   }
-
   return {
-    async resume(onSaved, onError) {
-      await mkdir(folder, { recursive: true });
-      const files = await readdir(folder, { withFileTypes: true });
-      for (const file of files) {
-        if (!file.isFile() || !/^pending-[0-9a-f]{16}\.(?:jpg|png|webp)$/.test(file.name)) continue;
-        try {
-          onSaved(await namePhoto(file.name));
-        } catch (error) {
-          onError(error);
-        }
-      }
-    },
-    async save(messageId, downloadMedia) {
+    async importPhoto(messageId, downloadMedia) {
       if (typeof messageId !== 'string' || !messageId) throw new Error('WhatsApp did not provide a photo message ID.');
       const id = createHash('sha256').update(messageId).digest('hex').slice(0, 16);
-      const savedPhoto = new RegExp(`(?:-| - )${id}\\.(?:jpg|png|webp)$`);
-      const existing = (await readdir(folder)).find(filename =>
-        savedPhoto.test(filename));
-      if (existing) return existing.startsWith('pending-') ? namePhoto(existing) : null;
+      const savedDate = savedDates.get(id);
+      if (savedDate) return { status: savedDate.startsWith(month + '-') ? 'existing' : 'outsideMonth' };
 
       const media = await downloadMedia();
       if (!media?.data) throw new Error('WhatsApp could not download the photo.');
       const extension = imageExtensions[media.mimetype.toLowerCase()];
       if (!extension) throw new Error('The photo format is unsupported.');
 
-      const pending = `pending-${id}.${extension}`;
+      const bytes = Buffer.from(media.data, 'base64');
+      const contentId = createHash('sha256').update(bytes).digest('hex');
+      const existingDate = contentDates.get(contentId);
+      if (existingDate) return { status: existingDate.startsWith(month + '-') ? 'existing' : 'outsideMonth' };
+      const details = receiptDetails(await recognize(bytes));
+      if (!details) return { status: 'unreadable' };
+      if (!details.date.startsWith(month + '-')) return { status: 'outsideMonth' };
+
+      const name = `${details.date} - ${details.store || 'store-unknown'} - ${id}.${extension}`;
       const temp = join(folder, `.watsapp-${randomUUID()}.tmp`);
       try {
-        await writeFile(temp, Buffer.from(media.data, 'base64'), { flag: 'wx' });
-        await rename(temp, join(folder, pending));
+        await writeFile(temp, bytes, { flag: 'wx' });
+        await rename(temp, join(folder, name));
       } finally {
         await rm(temp, { force: true });
       }
-      return namePhoto(pending);
+      savedDates.set(id, details.date);
+      contentDates.set(contentId, details.date);
+      return { status: 'saved', name };
     }
   };
 }
 
-module.exports = { createReceiptSaver, receiptDetails, recognizeReceipt };
+module.exports = { createReceiptImporter, receiptDetails, recognizeReceipt };

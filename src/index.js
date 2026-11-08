@@ -2,17 +2,13 @@ const { mkdir } = require('node:fs/promises');
 const { resolve } = require('node:path');
 const { setTimeout: delay } = require('node:timers/promises');
 const { parseArgs } = require('node:util');
-const { createReceiptSaver, recognizeReceipt } = require('./receipt');
-const { downloadPhoto } = require('./whatsapp');
+const { createReceiptImporter, recognizeReceipt } = require('./receipt');
+const { downloadPhoto, loadPhotoIds } = require('./whatsapp');
 
 const usage = [
   'npm start -- --list-groups',
   'npm start -- --group <group name or ID> --folder <path> [--show-browser]'
 ].join('\n');
-
-function logSaved(name) {
-  console.log(name.startsWith('review-') ? `Needs review: ${name}` : `Saved: ${name}`);
-}
 
 async function findGroups(client, selection, signal) {
   const deadline = Date.now() + 30_000;
@@ -22,7 +18,7 @@ async function findGroups(client, selection, signal) {
       const chats = window.require('WAWebCollections').Chat.getModelsArray();
       const groups = [];
       for (const chat of chats) {
-        const id = chat.id?._serialized ?? chat.id?.serialized;
+        const id = chat.id?._serialized ?? chat.id?.serialized ?? chat.id?.$1;
         if (typeof id !== 'string' || !id.endsWith('@g.us')) continue;
         const name = chat.formattedTitle;
         if (!target || target === id || target === name) groups.push({ id, name });
@@ -70,9 +66,6 @@ async function main() {
   });
 
   let worker;
-  let queue = Promise.resolve();
-  let receive;
-  const logError = error => console.error(`Receipt processing failed: ${error.message ?? error}`);
   const stop = new AbortController();
   const interrupt = () => stop.abort();
   process.once('SIGINT', interrupt);
@@ -103,7 +96,17 @@ async function main() {
     const [group] = groups;
     if (!group) throw new Error('Group not found. Run with --list-groups to check its name or ID.');
 
-    const saver = createReceiptSaver(folder, async photo => {
+    const now = new Date();
+    const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    console.log(`Loading image history from "${group.name}" for receipts dated ${month}.`);
+    const { photos, missingIds } = await Promise.race([
+      loadPhotoIds(client.pupPage, group.id),
+      stopped.then(() => ({ photos: [], missingIds: 0 }))
+    ]);
+    if (stop.signal.aborted) return;
+    console.log(`Checking ${photos.length} available images.`);
+
+    const importer = await createReceiptImporter(folder, month, async photo => {
       if (!worker) {
         const { createWorker } = require('tesseract.js');
         const cachePath = resolve('.ocr-cache');
@@ -112,23 +115,28 @@ async function main() {
       }
       return recognizeReceipt(worker, photo);
     });
-    queue = saver.resume(logSaved, logError);
-    receive = message => {
-      const chatId = message.fromMe ? message.to : message.from;
-      if (chatId !== group.id || message.type !== 'image' || !message.hasMedia) return;
-      const messageId = message.id._serialized ?? message.id.$1;
-      queue = queue.then(() => saver.save(messageId, () => downloadPhoto(client.pupPage, messageId))).then(name => {
-        if (name) logSaved(name);
-      }).catch(logError);
-    };
-    client.on('message_create', receive);
-    console.log(`Watching "${group.name}" and saving photos to ${folder}`);
-    await stopped;
+    const counts = { saved: 0, existing: 0, outsideMonth: 0, unreadable: 0, failed: missingIds };
+    const failures = new Map();
+    for (const [index, id] of photos.entries()) {
+      if (stop.signal.aborted) break;
+      if (index > 0 && index % 10 === 0) console.log(`Checked ${index} of ${photos.length} images.`);
+      try {
+        const { status, name } = await importer.importPhoto(id, () => downloadPhoto(client.pupPage, id));
+        counts[status]++;
+        if (name) console.log(`Saved: ${name}`);
+      } catch (error) {
+        counts.failed++;
+        const reason = error.message ?? String(error);
+        failures.set(reason, (failures.get(reason) ?? 0) + 1);
+      }
+    }
+    console.log(`Imported ${counts.saved}; already saved ${counts.existing}; outside month ${counts.outsideMonth}; unreadable ${counts.unreadable}; failed ${counts.failed}.`);
+    if (missingIds) console.error(`${missingIds} photos had no WhatsApp message ID.`);
+    for (const [reason, count] of failures) console.error(`${count} failed: ${reason}`);
+    if (counts.failed) process.exitCode = 1;
   } finally {
-    if (receive) client.off('message_create', receive);
     process.off('SIGINT', interrupt);
     process.off('SIGTERM', interrupt);
-    await queue.catch(logError);
     if (worker) await worker.terminate();
     const browser = client.pupBrowser;
     // whatsapp-web.js still checks isConnected(), which Puppeteer 25 removed.
