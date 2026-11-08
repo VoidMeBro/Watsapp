@@ -1,5 +1,6 @@
 const { mkdir } = require('node:fs/promises');
 const { resolve } = require('node:path');
+const { setTimeout: delay } = require('node:timers/promises');
 const { parseArgs } = require('node:util');
 const { createReceiptSaver } = require('./receipt');
 
@@ -10,6 +11,27 @@ const usage = [
 
 function logSaved(name) {
   console.log(name.startsWith('review-') ? `Needs review: ${name}` : `Saved: ${name}`);
+}
+
+async function findGroups(client, selection, signal) {
+  const deadline = Date.now() + 30_000;
+  while (!signal.aborted) {
+    // Reading the chat list directly avoids fetching metadata for every chat.
+    const groups = await client.pupPage.evaluate(target => {
+      const chats = window.require('WAWebCollections').Chat.getModelsArray();
+      const groups = [];
+      for (const chat of chats) {
+        const id = chat.id?._serialized ?? chat.id?.serialized;
+        if (typeof id !== 'string' || !id.endsWith('@g.us')) continue;
+        const name = chat.formattedTitle;
+        if (!target || target === id || target === name) groups.push({ id, name });
+      }
+      return groups;
+    }, selection);
+    if (groups.length || Date.now() >= deadline) return groups;
+    await delay(2_000);
+  }
+  return [];
 }
 
 async function main() {
@@ -69,24 +91,16 @@ async function main() {
     await Promise.race([Promise.all([client.initialize(), ready]), stopped]);
     if (stop.signal.aborted) return;
 
+    console.log('WhatsApp linked. Waiting for the chat list.');
+    const groups = await findGroups(client, listGroups ? null : groupNameOrId, stop.signal);
+    if (stop.signal.aborted) return;
     if (listGroups) {
-      const chats = await client.getChats();
-      for (const chat of chats.filter(chat => chat.isGroup)) {
-        console.log(`${chat.id._serialized}\t${chat.name}`);
-      }
+      for (const group of groups) console.log(`${group.id}\t${group.name}`);
       return;
     }
-
-    let group;
-    if (/^\d+(?:-\d+)?@g\.us$/.test(groupNameOrId)) {
-      group = await client.getChatById(groupNameOrId);
-    } else {
-      const matches = (await client.getChats()).filter(chat => chat.isGroup && chat.name === groupNameOrId);
-      if (matches.length > 1) throw new Error('More than one group has that name. Use --list-groups to find its ID.');
-      [group] = matches;
-    }
-    if (!group?.isGroup) throw new Error('Group not found. Run with --list-groups to check its name or ID.');
-    const groupId = group.id._serialized;
+    if (groups.length > 1) throw new Error('More than one group has that name. Use --list-groups to find its ID.');
+    const [group] = groups;
+    if (!group) throw new Error('Group not found. Run with --list-groups to check its name or ID.');
 
     const saver = createReceiptSaver(folder, async photo => {
       if (!worker) {
@@ -101,7 +115,7 @@ async function main() {
     queue = saver.resume(logSaved, logError);
     receive = message => {
       const chatId = message.fromMe ? message.to : message.from;
-      if (chatId !== groupId || message.type !== 'image' || !message.hasMedia) return;
+      if (chatId !== group.id || message.type !== 'image' || !message.hasMedia) return;
       queue = queue.then(() => saver.save(message)).then(name => {
         if (name) logSaved(name);
       }).catch(logError);
