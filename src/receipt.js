@@ -98,9 +98,10 @@ async function recoverReceiptFields(worker, photo, width, height, details, total
   const merchants = new Set();
   const totals = new Set();
   const logoNames = new Set();
+  const headerVotes = new Map();
   function checkLogo(line) {
     const logo = line.replace(/[^a-z]/gi, '').toLowerCase();
-    if (/^(?:p|h)?icknpay$|^hcknpay$/.test(logo)) logoNames.add('Pick n Pay');
+    if (/^(?:[pbhg])?ickn[pf]ay$|^hcknpay$/.test(logo)) logoNames.add('Pick n Pay');
     if (logo === 'woolworths') logoNames.add('Woolworths');
   }
   for (const line of alternateText.split(/\r?\n/)) checkLogo(line);
@@ -108,6 +109,7 @@ async function recoverReceiptFields(worker, photo, width, height, details, total
     const top = band * .06;
     const bottom = Math.min(1, top + .10);
     const text = await read(.12, top, .85, bottom);
+    const headerNames = new Set();
     if (!total) {
       const amount = receiptTotal(text);
       if (amount) totals.add(amount);
@@ -115,14 +117,20 @@ async function recoverReceiptFields(worker, photo, width, height, details, total
     for (const line of text.split(/\r?\n/)) {
       // Normalize common logo OCR variants alongside the generic merchant labels.
       checkLogo(line);
-      const labeled = /\b(?:store|merchant|retailer)\s*:\s*(\p{L}.*)$/iu.exec(line)?.[1];
+      const labeled = /\b(?:store|merchant|retailer|shop\s*name)\s*:\s*(\p{L}.*)$/iu.exec(line)?.[1];
       const name = safeStoreName(labeled || storeFooter.exec(line.trim())?.[1]);
       if (name) merchants.add(name);
+      const header = line.trim();
+      if (top <= .42 && /^(?:THE\s+)?[A-Z]{3,}(?:\s+[A-Z]{3,})+$/.test(header) &&
+          !/\b(?:bank|retail|invoice|copy|discount|sale|gross|total articles|customer|road|street|avenue)\b/i.test(header)) {
+        headerNames.add(header);
+      }
       if (!date && !otherDate.test(line) && /\b\d{1,2}:\d{2}\b/.test(line)) {
         const candidate = receiptDate(line);
         if (candidate) dates.add(candidate);
       }
     }
+    for (const name of headerNames) headerVotes.set(name, (headerVotes.get(name) ?? 0) + 1);
   }
   if (!date && dates.size === 0) {
     for (let band = 13; band < 16; band++) {
@@ -146,9 +154,18 @@ async function recoverReceiptFields(worker, photo, width, height, details, total
   }
   if (!date && dates.size === 1) [date] = dates;
   if (merchants.size === 1) [store] = merchants;
-  if (!store && logoNames.size === 1) [store] = logoNames;
+  else if (logoNames.size === 1) [store] = logoNames;
+  else if (!reliableStore(store)) {
+    const ranked = [...headerVotes].sort((a, b) => b[1] - a[1]);
+    store = ranked[0]?.[1] >= 2 && ranked[0][1] > (ranked[1]?.[1] ?? 0) ? ranked[0][0] : null;
+  }
   if (!total && totals.size === 1) [total] = totals;
   return date ? { ...details, date, store, ...(total ? { total } : {}) } : null;
+}
+
+function reliableStore(store) {
+  return Boolean(store && /\p{L}{4}/u.test(store) &&
+    !/\b(?:sale\s*&\s*re|whole\s*sale|retail|stadium$)/i.test(store));
 }
 
 function receiptDetails(text) {
@@ -314,7 +331,7 @@ async function recognizeReceipt(worker, photo, { page, month } = {}) {
   const total = details
     ? await recognizeTotal(worker, photo, text, width, height, PSM.SINGLE_BLOCK)
     : receiptTotal(text);
-  if (details?.store && total) return { ...details, total };
+  if (reliableStore(details?.store) && total) return { ...details, total };
   if (width >= 100 && height >= 100 && (page || details?.store)) {
     return recoverReceiptFields(worker, photo, width, height, details, total, sparseText);
   }

@@ -119,18 +119,34 @@ async function main() {
     });
     const counts = { saved: 0, existing: 0, review: 0, failed: missingIds };
     const failures = new Map();
-    for (const [index, id] of photos.entries()) {
-      if (stop.signal.aborted) break;
-      if (index > 0 && index % 10 === 0) console.log(`Checked ${index} of ${photos.length} images.`);
+    const retry = [];
+    async function importImage(id, retryUnavailable) {
       try {
         const { status, name, inferred } = await importer.importPhoto(id, () => downloadPhoto(client.pupPage, id));
         counts[status]++;
         if (name) console.log(`${status === 'review' ? 'Needs review' : 'Saved'}: ${name}`);
         if (inferred) console.log('Used the gallery month and year for a clipped receipt date.');
       } catch (error) {
-        counts.failed++;
         const reason = error.message ?? String(error);
+        if (retryUnavailable && reason.includes('HTTP 404')) {
+          retry.push(id);
+          return;
+        }
+        counts.failed++;
         failures.set(reason, (failures.get(reason) ?? 0) + 1);
+      }
+    }
+    for (const [index, id] of photos.entries()) {
+      if (stop.signal.aborted) break;
+      if (index > 0 && index % 10 === 0) console.log(`Checked ${index} of ${photos.length} images.`);
+      await importImage(id, true);
+    }
+    if (retry.length && !stop.signal.aborted) {
+      console.log(`Waiting for WhatsApp Web before retrying ${retry.length} unavailable images.`);
+      await Promise.race([delay(15_000, undefined, { ref: false }), stopped]);
+      for (const id of retry) {
+        if (stop.signal.aborted) break;
+        await importImage(id, false);
       }
     }
     console.log(`Imported ${counts.saved + counts.review}; of those, ${counts.review} need review. Already saved ${counts.existing}; failed ${counts.failed}.`);
