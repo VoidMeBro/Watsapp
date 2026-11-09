@@ -9,7 +9,7 @@ Watsapp imports photos from a WhatsApp group's **Media → This month** section 
 3. The first time, scan the QR code from **WhatsApp → Linked devices → Link a device** on your phone. Watsapp imports this month's gallery photos, prints a summary, and exits.
 
 ```powershell
-npm start -- --group "My Receipt Group" --folder "C:\Users\YourName\Documents\Receipts"
+npm start -- --group "My Receipt Group" --folder "C:\Users\YourName\Documents\Receipts" --show-browser
 ```
 
 Use `npm.cmd` in place of `npm` if PowerShell blocks the npm script. Run the command again whenever you want to refresh the folder. Watsapp reuses the linked session. It uses [whatsapp-web.js](https://docs.wwebjs.dev/), an unofficial WhatsApp Web integration that can break when WhatsApp changes its web client.
