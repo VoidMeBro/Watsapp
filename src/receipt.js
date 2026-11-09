@@ -80,6 +80,77 @@ async function recognizeTotal(worker, photo, text, width, height, mode) {
   return confirmed.length === 1 ? confirmed[0][0] : null;
 }
 
+async function recoverReceiptFields(worker, photo, width, height, details, total, alternateText) {
+  const { PSM } = require('tesseract.js');
+  async function read(left, top, right, bottom, mode = PSM.SINGLE_BLOCK) {
+    const { data } = await worker.recognize(photo, {
+      tessedit_pageseg_mode: mode,
+      rectangle: {
+        left: Math.round(width * left), top: Math.round(height * top),
+        width: Math.round(width * (right - left)), height: Math.round(height * (bottom - top))
+      }
+    });
+    return data.text;
+  }
+  let date = details?.date;
+  let store = details?.store;
+  const dates = new Set();
+  const merchants = new Set();
+  const totals = new Set();
+  const logoNames = new Set();
+  function checkLogo(line) {
+    const logo = line.replace(/[^a-z]/gi, '').toLowerCase();
+    if (/^(?:p|h)?icknpay$|^hcknpay$/.test(logo)) logoNames.add('Pick n Pay');
+    if (logo === 'woolworths') logoNames.add('Woolworths');
+  }
+  for (const line of alternateText.split(/\r?\n/)) checkLogo(line);
+  for (let band = 0; band < 16; band++) {
+    const top = band * .06;
+    const bottom = Math.min(1, top + .10);
+    const text = await read(.12, top, .85, bottom);
+    if (!total) {
+      const amount = receiptTotal(text);
+      if (amount) totals.add(amount);
+    }
+    for (const line of text.split(/\r?\n/)) {
+      // Normalize common logo OCR variants alongside the generic merchant labels.
+      checkLogo(line);
+      const labeled = /\b(?:store|merchant|retailer)\s*:\s*(\p{L}.*)$/iu.exec(line)?.[1];
+      const name = safeStoreName(labeled || storeFooter.exec(line.trim())?.[1]);
+      if (name) merchants.add(name);
+      if (!date && !otherDate.test(line) && /\b\d{1,2}:\d{2}\b/.test(line)) {
+        const candidate = receiptDate(line);
+        if (candidate) dates.add(candidate);
+      }
+    }
+  }
+  if (!date && dates.size === 0) {
+    for (let band = 13; band < 16; band++) {
+      const top = band * .06;
+      const text = await read(.48, top, .82, Math.min(1, top + .10));
+      for (const line of text.split(/\r?\n/)) {
+        if (otherDate.test(line) || !/\b\d{1,2}:\d{2}\b/.test(line)) continue;
+        const candidate = receiptDate(line);
+        if (candidate) dates.add(candidate);
+      }
+    }
+  }
+  if (!date && dates.size === 0) {
+    for (let band = 0; band < 15; band++) {
+      const top = .80 + band * .012;
+      const text = await read(.50, top, .76, Math.min(1, top + .033), PSM.SINGLE_LINE);
+      if (otherDate.test(text) || !/\b\d{1,2}:\d{2}\b/.test(text)) continue;
+      const candidate = receiptDate(text);
+      if (candidate) dates.add(candidate);
+    }
+  }
+  if (!date && dates.size === 1) [date] = dates;
+  if (merchants.size === 1) [store] = merchants;
+  if (!store && logoNames.size === 1) [store] = logoNames;
+  if (!total && totals.size === 1) [total] = totals;
+  return date ? { ...details, date, store, ...(total ? { total } : {}) } : null;
+}
+
 function receiptDetails(text) {
   const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   if (!receiptMarker.test(text) || !lines.some(line => money.test(line) && !receiptDate(line))) return null;
@@ -191,6 +262,7 @@ async function recognizeReceipt(worker, photo, { page, month } = {}) {
   const { PSM } = require('tesseract.js');
   let { data } = await worker.recognize(photo, {}, { text: true, blocks: true, tsv: true });
   let details = receiptDetails(data.text);
+  let sparseText = '';
   const dimensions = data.tsv.split('\n', 1)[0].split('\t');
   const width = Number(dimensions[8]);
   const height = Number(dimensions[9]);
@@ -209,6 +281,7 @@ async function recognizeReceipt(worker, photo, { page, month } = {}) {
     ];
     for (const options of passes) {
       const { data: alternate } = await worker.recognize(photo, options, { text: true, blocks: true });
+      if (options.tessedit_pageseg_mode === PSM.SPARSE_TEXT) sparseText = alternate.text;
       const result = receiptDetails(alternate.text);
       if (result?.store || (!details && result)) {
         data = alternate;
@@ -238,9 +311,14 @@ async function recognizeReceipt(worker, photo, { page, month } = {}) {
   if (!details && page && month && width >= 100 && height >= 100) {
     details = await readClippedDate(worker, photo, page, month, width, height, text);
   }
-  if (!details) return null;
-  const total = await recognizeTotal(worker, photo, text, width, height, PSM.SINGLE_BLOCK);
-  return total ? { ...details, total } : details;
+  const total = details
+    ? await recognizeTotal(worker, photo, text, width, height, PSM.SINGLE_BLOCK)
+    : receiptTotal(text);
+  if (details?.store && total) return { ...details, total };
+  if (width >= 100 && height >= 100 && (page || details?.store)) {
+    return recoverReceiptFields(worker, photo, width, height, details, total, sparseText);
+  }
+  return details;
 }
 
 async function createReceiptImporter(folder, recognize) {
@@ -286,8 +364,11 @@ async function createReceiptImporter(folder, recognize) {
       const amount = details?.total ? 'R' + details.total : 'total-unknown';
       if (saved) {
         const prefix = /^(\d{4}-\d{2}-\d{2} - .+?) (?:- total-unknown )?- [0-9a-f]{16}\./i.exec(saved.name)?.[1];
-        if (!details?.total || !prefix) return { status: 'existing' };
-        const name = [prefix, amount, saved.id].join(' - ') + '.' + saved.name.split('.').pop();
+        if (!details?.total || (!prefix && !details.store)) return { status: 'existing' };
+        const label = /^(?:review-)| - total-unknown - /i.test(saved.name) && details.store
+          ? [details.date, details.store].join(' - ')
+          : prefix;
+        const name = [label, amount, saved.id].join(' - ') + '.' + saved.name.split('.').pop();
         await rename(join(folder, saved.name), join(folder, name));
         saved.name = name;
         return { status: 'saved', name };
