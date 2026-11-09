@@ -46,6 +46,40 @@ function safeStoreName(store) {
   return Array.from(safeStore).slice(0, 60).join('').replace(/[ .]+$/, '') || null;
 }
 
+function receiptTotal(text) {
+  const totals = new Set();
+  for (const line of text.split(/\r?\n/)) {
+    if (/\b(?:sub\s*total|exclusive|vat|tax|saving\w*|saved|discount|change)\b/i.test(line)) continue;
+    if (!/^\s*(?:[^\w]*|[A-Z]{1,4}\s+)(?:(?:grand|invoice|inclusive invoice)\s+total|total\b|amount\s+(?:due|paid)|check[1\]]?(?=\s))/i.test(line)) continue;
+    const amount = /(?:^|[\s:R])(\d{1,3}(?:,\d{3})+|\d+)\s*[.,]\s*(\d{2})\s*[A-Z|]*\s*$/i.exec(line);
+    if (amount) totals.add(amount[1].replace(/,/g, '') + '.' + amount[2]);
+  }
+  return totals.size === 1 ? [...totals][0] : null;
+}
+
+async function recognizeTotal(worker, photo, text, width, height, mode) {
+  const total = receiptTotal(text);
+  if (total || !(width >= 100 && height >= 100)) return total;
+  const votes = new Map();
+  for (const [top, span, left, spanX] of [
+    [.40, .10, .06, .69], [.46, .10, .06, .69],
+    [.58, .05, .066, .603], [.59, .04, .066, .603],
+    [.64, .10, .066, .603], [.70, .10, .066, .603]
+  ]) {
+    const { data } = await worker.recognize(photo, {
+      tessedit_pageseg_mode: mode,
+      rectangle: {
+        left: Math.round(width * left), top: Math.round(height * top),
+        width: Math.round(width * spanX), height: Math.round(height * span)
+      }
+    });
+    const amount = receiptTotal(data.text);
+    if (amount) votes.set(amount, (votes.get(amount) ?? 0) + 1);
+  }
+  const confirmed = [...votes].filter(([, count]) => count >= 2);
+  return confirmed.length === 1 ? confirmed[0][0] : null;
+}
+
 function receiptDetails(text) {
   const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   if (!receiptMarker.test(text) || !lines.some(line => money.test(line) && !receiptDate(line))) return null;
@@ -201,36 +235,47 @@ async function recognizeReceipt(worker, photo, { page, month } = {}) {
     }
   }
   details = receiptDetails(text);
-  if (details || !page || !month || !(width >= 100 && height >= 100)) return details;
-
-  return readClippedDate(worker, photo, page, month, width, height, text);
+  if (!details && page && month && width >= 100 && height >= 100) {
+    details = await readClippedDate(worker, photo, page, month, width, height, text);
+  }
+  if (!details) return null;
+  const total = await recognizeTotal(worker, photo, text, width, height, PSM.SINGLE_BLOCK);
+  return total ? { ...details, total } : details;
 }
 
 async function createReceiptImporter(folder, recognize) {
   const files = await readdir(folder, { withFileTypes: true });
-  const savedIds = new Set();
-  const savedHashes = new Set();
+  const savedIds = new Map();
+  const savedHashes = new Map();
   for (const file of files) {
     const match = /^(?:\d{4}-\d{2}-\d{2} - .+ - |review-)([0-9a-f]{16})\.(?:jpe?g|png|webp)$/i.exec(file.name);
     if (!file.isFile() || !match) continue;
-    savedIds.add(match[1]);
     const bytes = await readFile(join(folder, file.name));
-    savedHashes.add(createHash('sha256').update(bytes).digest('hex'));
+    const saved = { name: file.name, id: match[1] };
+    savedIds.set(saved.id, saved);
+    savedHashes.set(createHash('sha256').update(bytes).digest('hex'), saved);
   }
   return {
     async importPhoto(messageId, downloadMedia) {
       if (typeof messageId !== 'string' || !messageId) throw new Error('WhatsApp did not provide a photo message ID.');
       const id = createHash('sha256').update(messageId).digest('hex').slice(0, 16);
-      if (savedIds.has(id)) return { status: 'existing' };
+      let saved = savedIds.get(id);
+      let bytes;
+      let extension;
+      if (saved) {
+        bytes = await readFile(join(folder, saved.name));
+        extension = saved.name.split('.').pop();
+      } else {
+        const media = await downloadMedia();
+        if (!media?.data) throw new Error('WhatsApp could not download the photo.');
+        extension = imageExtensions[media.mimetype.toLowerCase()];
+        if (!extension) throw new Error('The photo format is unsupported.');
+        bytes = Buffer.from(media.data, 'base64');
+      }
 
-      const media = await downloadMedia();
-      if (!media?.data) throw new Error('WhatsApp could not download the photo.');
-      const extension = imageExtensions[media.mimetype.toLowerCase()];
-      if (!extension) throw new Error('The photo format is unsupported.');
-
-      const bytes = Buffer.from(media.data, 'base64');
       const contentId = createHash('sha256').update(bytes).digest('hex');
-      if (savedHashes.has(contentId)) return { status: 'existing' };
+      saved ??= savedHashes.get(contentId);
+      if (saved && / - R\d+\.\d{2} - /i.test(saved.name)) return { status: 'existing' };
       let details;
       try {
         details = await recognize(bytes);
@@ -238,8 +283,17 @@ async function createReceiptImporter(folder, recognize) {
         // Keep the original photo when OCR cannot process it.
       }
 
+      const amount = details?.total ? 'R' + details.total : 'total-unknown';
+      if (saved) {
+        const prefix = /^(\d{4}-\d{2}-\d{2} - .+?) (?:- total-unknown )?- [0-9a-f]{16}\./i.exec(saved.name)?.[1];
+        if (!details?.total || !prefix) return { status: 'existing' };
+        const name = [prefix, amount, saved.id].join(' - ') + '.' + saved.name.split('.').pop();
+        await rename(join(folder, saved.name), join(folder, name));
+        saved.name = name;
+        return { status: 'saved', name };
+      }
       const name = details
-        ? `${details.date} - ${details.store || 'store-unknown'} - ${id}.${extension}`
+        ? `${details.date} - ${details.store || 'store-unknown'} - ${amount} - ${id}.${extension}`
         : `review-${id}.${extension}`;
       const temp = join(folder, `.watsapp-${randomUUID()}.tmp`);
       try {
@@ -248,11 +302,12 @@ async function createReceiptImporter(folder, recognize) {
       } finally {
         await rm(temp, { force: true });
       }
-      savedIds.add(id);
-      savedHashes.add(contentId);
-      return { status: details?.store ? 'saved' : 'review', name, inferred: details?.inferred };
+      saved = { name, id };
+      savedIds.set(id, saved);
+      savedHashes.set(contentId, saved);
+      return { status: details?.store && details.total ? 'saved' : 'review', name, inferred: details?.inferred };
     }
   };
 }
 
-module.exports = { createReceiptImporter, receiptDetails, recognizeReceipt };
+module.exports = { createReceiptImporter, receiptDetails, receiptTotal, recognizeReceipt };

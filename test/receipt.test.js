@@ -1,11 +1,17 @@
 const assert = require('node:assert/strict');
-const { mkdtemp, readFile, readdir, rmdir, unlink } = require('node:fs/promises');
+const { mkdtemp, readFile, readdir, rename, rmdir, unlink } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const test = require('node:test');
-const { createReceiptImporter, receiptDetails, recognizeReceipt } = require('../src/receipt');
+const { createReceiptImporter, receiptDetails, receiptTotal, recognizeReceipt } = require('../src/receipt');
 
 const receipt = 'Fresh Market\nVAT INVOICE\nReturn by 07/12/2026\nDate: 5 Nov 2026\nTOTAL R49.99';
+
+test('extracts the final total and rejects conflicting amounts', () => {
+  assert.equal(receiptTotal('Subtotal 544.52\nExclusive Invoice Total 544.52\nInclusive Invoice Total : 626.20\nVAT 81.68'), '626.20');
+  assert.equal(receiptTotal('CHECK] R1,179. 50'), '1179.50');
+  assert.equal(receiptTotal('TOTAL R10.00\nAMOUNT PAID R20.00'), null);
+});
 
 test('extracts the transaction date and ignores invalid dates and unrelated text', () => {
   assert.deepEqual(receiptDetails(receipt), { date: '2026-11-05', store: 'Fresh Market' });
@@ -32,7 +38,7 @@ test('retries separated text before interpreting a cropped short date', async ()
     }
   };
   assert.deepEqual(await recognizeReceipt(worker, Buffer.from('stand-in for a photo')), {
-    date: '2026-11-03', store: 'FANTASY'
+    date: '2026-11-03', store: 'FANTASY', total: '179.50'
   });
 });
 
@@ -70,13 +76,19 @@ test('uses the printed date for naming and skips existing photos', async t => {
     downloads++;
     return { mimetype: 'image/png', data: bytes.toString('base64') };
   };
-  const importer = await createReceiptImporter(folder, async () => receiptDetails(receipt));
+  const recognize = async () => ({ ...receiptDetails(receipt), total: '49.99' });
+  const importer = await createReceiptImporter(folder, recognize);
   const saved = await importer.importPhoto('photo-1', downloadMedia);
   assert.equal(saved.status, 'saved');
-  assert.match(saved.name, /^2026-11-05 - Fresh Market - [0-9a-f]{16}\.png$/);
+  assert.match(saved.name, /^2026-11-05 - Fresh Market - R49\.99 - [0-9a-f]{16}\.png$/);
   assert.deepEqual(await readFile(join(folder, saved.name)), bytes);
   assert.deepEqual(await importer.importPhoto('photo-1', downloadMedia), { status: 'existing' });
   assert.deepEqual(await importer.importPhoto('forwarded-photo-1', downloadMedia), { status: 'existing' });
+  assert.equal(downloads, 2);
+  const oldName = saved.name.replace(' - R49.99', '');
+  await rename(join(folder, saved.name), join(folder, oldName));
+  const rerun = await createReceiptImporter(folder, recognize);
+  assert.equal((await rerun.importPhoto('photo-1', downloadMedia)).name, saved.name);
   assert.equal(downloads, 2);
 
   const unreadable = await createReceiptImporter(folder, async () => null);

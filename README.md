@@ -21,5 +21,6 @@ Add `--show-browser` to scan the QR code in a WhatsApp Web window.
 - A receipt might be saved as `2026-11-05 - Fresh Market - a1b2c3d4e5f67890.jpg`. The suffix distinguishes receipts from the same store on the same date and prevents the same message from being saved twice.
 - The gallery month determines which photos to import. The filename uses the printed receipt date, which can fall in a different month. Ambiguous numeric dates use day/month/year.
 - If the date row is clipped and two OCR passes agree on the visible day, Watsapp uses the gallery month and year and reports that inference.
+- Filenames include the final amount in rand, for example `2026-11-02 - The Stadium Butchery - R626.20 - ef3c979d6a459940.jpg`. Unclear amounts are flagged as `total-unknown`. Rerun the import to add totals to previously named photos in the current gallery.
 - Photos with an unreadable date keep a `review-...` filename. If the date is readable but the store is missing, the filename contains `store-unknown`.
 - Watsapp reports gallery photos it couldn't download. It processes images on your computer and saves their original bytes. The first OCR run downloads English language data.
